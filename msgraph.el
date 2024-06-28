@@ -4,6 +4,12 @@
 
 ;; Author: Kishor Datar (kishordatar at gmail)
 
+;; Homepage: http://localhost
+;; Keywords: Custom
+
+;; Package-Version: 1.0.0
+;; Package-Requires: ((emacs "27.1"))
+
 ;; This program is free software; you can redistribute it and/or modify
 ;; it under the terms of the GNU General Public License as published by
 ;; the Free Software Foundation, either version 3 of the License, or
@@ -37,6 +43,8 @@
 (defvar
   msgraph-auth-info
   nil)
+
+(defvar msgraph-batch-size 20)
 
 (defface msgraph-auth-error-face '((t :inherit error)) "MSGraph authentication error face.")
 
@@ -116,9 +124,10 @@
 	   (or headers
 	       (list
 		(cons "Accept" "application/json")
-		(cons "Content-type" "application/json"))))))
-    (with-current-buffer
-        (url-retrieve-synchronously url nil nil 20)
+		(cons "Content-type" "application/json")))))
+	 (response (url-retrieve-synchronously url nil nil 20)))
+    (when (not response) (error "URL retrieval failed. Possibly timed out"))
+    (with-current-buffer response
       (beginning-of-buffer)
       (search-forward-regexp "\\([0-9][0-9][0-9]\\)" (max (point-max) 20))
       (setq response-code (match-string 1))
@@ -128,43 +137,55 @@
       (beginning-of-buffer)
       (list :result-code response-code :body response-body :buffer (current-buffer)))))
 
-(defun msgraph-read-response-with-retry (method url body &optional headers max-retries retry-backoff-sec)
+(defun msgraph-read-response-with-retry (method
+					 url
+					 body
+					 &optional
+					 headers
+					 bail-on-error
+					 max-retries
+					 retry-backoff-sec)
   (let* ((retries 0)
 	 (done)
 	 (retry-backoff-sec (or retry-backoff-sec 30))
 	 (max-retries (or max-retries 0))
-	 (last-response))
+	 (last-response)
+	 (last-response-code))
     (while (not done)
       (setq last-response (msgraph-read-response method url body headers))
+      (setq last-response-code (plist-get last-response :result-code))      
       (if (and (> retries max-retries)
-	       (or (string-equal "429" (plist-get last-response :result-code))
-		   (string-equal "504" (plist-get last-response :result-code))))
+	       (or (string-equal "429" last-response-code)
+		   (string-equal "504" last-response-code)))
 	  (progn
 	    (setq retries (1+ retries))
 	    (message
 	     "Received HTTP code %s. will retry after %d seconds ... "
-	     (plist-get last-response :result-code)
+	     last-response-code
 	     retry-backoff-sec)
 	    (sleep-for retry-backoff-sec)
 	    (setq retry-backoff-sec (* 2 retry-backoff-sec)))
+	(if (and bail-on-error
+		 (string-match-p "^\\(4\\|5\\)" last-response-code))
+	    (error last-response-code))
 	(setq done t)))
     last-response))
 
-(defun msgraph-read-json-response (method url body &optional headers)
+(defun msgraph-read-json-response (method url body &optional bail-on-error headers)
   (let* ((raw-response
-	  (msgraph-read-response-with-retry method url body headers)))
+	  (msgraph-read-response-with-retry method url body headers bail-on-error)))
     (if (string-equal "204" (plist-get raw-response :result-code))
 	nil
       (json-read-from-string (plist-get raw-response :body)))))
 
 (defun msgraph-get (url)
-  (msgraph-read-json-response "GET" url nil))
+  (msgraph-read-json-response "GET" url nil t))
 
 (defun msgraph-post (url body)
-  (msgraph-read-json-response "POST" url body))
+  (msgraph-read-json-response "POST" url body t))
 
 (defun msgraph-delete (url)
-  (msgraph-read-json-response "DELETE" url nil))
+  (msgraph-read-json-response "DELETE" url nil t))
 
 (defun msgraph-root ()
   (concat "https://" msgraph-host "/" msgraph-version "/"))
@@ -183,9 +204,72 @@
 			     "Authorization"
 			     (concat
 			      "Bearer "
-			      (plist-get auth-info :raw-token))))
+			      (plist-get auth-info :raw-token)))
+			    ;; (cons
+			    ;;  "User-Agent"
+			    ;; "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36 Edg/125.0.0.0")
+			    )
 		    nil)
 		  headers)))
     result))
 
+(defun msgraph-delete-batched (urls)
+  "Produced ordered output for each of the urls."
+  (let* ((idx)
+	 (partitions (seq-partition urls msgraph-batch-size))
+	 (result))
+    (setq idx 0)
+    (dolist (partition partitions)
+      (let* ((requests))
+	(dolist (url partition)
+	  (setq requests
+		(cons
+		 (list (cons 'id (number-to-string idx))
+		       (cons 'method "DELETE")
+		       (cons 'url url))
+		 requests))
+	  (setq idx (1+ idx)))
+
+	(setq result
+	      (cons
+	       (cdr
+		(assoc 'responses
+		       (msgraph-read-json-response
+			"POST"
+			(concat (msgraph-root) "$batch")
+			(json-encode (list (cons 'requests requests)))
+			t)))
+	       result))))
+
+    (let* ((responses))
+      (seq-doseq (batches result)
+	(seq-doseq (e batches)
+	  (setq responses (cons e responses))))
+      (seq-sort
+       (lambda (e1 e2)
+	 (< (string-to-number (cdr (assoc 'id e1)))
+	    (string-to-number (cdr (assoc 'id e2)))))
+       responses))))
+
+(defun msgraph-send-requests-batched (requests)
+  "The request IDs are assumed to be ordered unique numbers."
+  (let* ((partitions (seq-partition requests msgraph-batch-size))
+	 (responses))
+    (dolist (requests partitions)
+      (let* ((current-batch-responses
+	      (cdr
+	       (assoc 'responses
+		      (msgraph-read-json-response
+		       "POST"
+		       (concat (msgraph-root) "$batch")
+		       (json-encode (list (cons 'requests requests)))
+		       t)))))
+	(push current-batch-responses responses)))
+    (seq-sort
+       (lambda (e1 e2)
+	 (< (string-to-number (cdr (assoc 'id e1)))
+	    (string-to-number (cdr (assoc 'id e2)))))
+       (apply 'seq-concatenate (cons 'list responses)))))
+
 (provide 'msgraph)
+;;; msgraph.el ends here

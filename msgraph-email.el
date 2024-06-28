@@ -4,6 +4,13 @@
 
 ;; Author: Kishor Datar (kishordatar at gmail)
 
+;; Homepage: http://localhost
+;; Keywords: Custom
+
+;; Package-Version: 1.0.0
+;; Package-Requires: ((emacs "30.0"))
+
+
 ;; This program is free software; you can redistribute it and/or modify
 ;; it under the terms of the GNU General Public License as published by
 ;; the Free Software Foundation, either version 3 of the License, or
@@ -64,6 +71,7 @@
     (define-key map (kbd "&") 'msgraph-email-open-web-link)
     (define-key map (kbd "M-p") 'msgraph-email-previous-page)
     (define-key map "&" 'msgraph-email-open-web-link)
+    (define-key map "c" 'msgraph-email-web-compose-new)
     (define-key map "r" 'msgraph-email-render-body-html)
     (define-key map "s" 'msgraph-email-search)
     (define-key map "^" 'msgraph-email-navigate)
@@ -74,7 +82,7 @@
     (define-key map "C" 'msgraph-email-open-conversation)
     (define-key map "U" 'msgraph-email-remove-all-marks)
     (define-key map (kbd "M-r") 'msgraph-email-mark-as-read)
-    (define-key map (kbd "M-d") 'msgraph-email-delete)
+    (define-key map (kbd "M-d") 'msgraph-email-delete-batched)
     map))
 
 (defvar
@@ -124,6 +132,7 @@
    msgraph-email-mode-line-format
    t))
 
+;;;###autoload
 (defun msgraph-email ()
   (interactive)
 
@@ -205,6 +214,7 @@
 	 common-faces)
 	(aset row i column)))))
 
+;;;###autoload
 (defun msgraph-email-open-web-link ()
   (interactive)
   
@@ -212,6 +222,7 @@
       (error "no item selected.")
     (browse-url (cdr (assoc 'webLink (tabulated-list-get-id))))))
 
+;;;###autoload
 (defun msgraph-email-render-body-html ()
   (interactive)
 
@@ -227,6 +238,7 @@
       (beginning-of-buffer)
       (view-mode)))
 
+;;;###autoload
 (defun msgraph-email-mark-as-read ()
   (interactive)
   (dolist (row (msgraph-email-get-marked-or-current))
@@ -239,6 +251,7 @@
       (msgraph-email-propertize-row entry-id entry 'msgraph-email-read-face)))    
   (tabulated-list-print t))
 
+;;;###autoload
 (defun msgraph-email-refetch-current-page ()
   (interactive)
   (msgraph-email-navigate
@@ -259,19 +272,69 @@
     (or result
 	(list (list :id (tabulated-list-get-id) :entry (tabulated-list-get-entry))))))
 
-(defun msgraph-email-delete ()
+;;;###autoload
+(defun msgraph-email-delete-batched ()
   (interactive)
-  (when (y-or-n-p "Are you sure you want to delete the selected messages? ")
-    (dolist (row (msgraph-email-get-marked-or-current))
-      (let* ((entry-id (plist-get row :id))
-	     (entry (plist-get row :entry)))
-	(msgraph-read-json-response
-	   "DELETE"
-	   (concat (msgraph-root) "me/messages/" (cdr (assoc 'id entry-id)))
-	   nil)
-	(msgraph-email-propertize-row entry-id entry 'msgraph-email-deleted-face)))
-      (tabulated-list-print t)))
+  (when (y-or-n-p
+	 (format "Are you sure you want to %s delete the selected messages? "
+		 (if current-prefix-arg "hard" "soft")))
+    (msgraph-email-move-batched
+     (if current-prefix-arg
+	 (plist-get
+	  (gethash
+	   "Deletions"
+	   (msgraph-email-cache-get-folders-by-display-name))
+	  :id)
+       "deleteditems"))))
 
+;;;###autoload
+(defun msgraph-email-move-batched (&optional dest)
+  (interactive)
+
+  (unless dest
+    (msgraph-email-ensure-cache)
+    (setq dest
+	  (plist-get
+	   (gethash 
+	    (completing-read
+	     "Enter the destination folder name: "
+	     (msgraph-email-cache-get-folders-by-display-name))
+	    (msgraph-email-cache-get-folders-by-display-name))
+	   :id)))
+  
+  (let* ((selection (msgraph-email-get-marked-or-current))
+	 (requests)
+	 (responses)
+	 (id 0))
+
+    (dolist (row selection)
+      (let* ((entry-id (plist-get row :id))
+	     (entry (plist-get row :entry))
+	     (message-id (cdr (assoc 'id entry-id))))
+	(push
+	 (list (cons 'id id)
+	       (cons 'method "POST")
+	       (cons 'url (format "me/messages/%s/move" message-id))
+	       (cons 'body (list (cons "destinationId" dest)))
+	       (cons 'headers (list (cons "Content-type" "application/json"))))
+	 requests)
+	(setq id (1+ id))))
+    (setq requests (reverse requests))
+    
+    (setq responses (msgraph-send-requests-batched requests))
+
+    (dolist (item (seq-mapn 'cons selection responses))
+      (let* ((row (car item))
+	     (status (cdr (assoc 'status (cdr item))))
+	     (entry-id (plist-get row :id))
+	     (entry (plist-get row :entry))
+	     (message-id (cdr (assoc 'id entry-id))))
+	(if (or (and (>= status 200) (< status 300)))
+	    (msgraph-email-propertize-row entry-id entry 'msgraph-email-deleted-face)
+	  (message "Error %d, could not move message %s" status message-id))))
+    (tabulated-list-print t)))
+
+;;;###autoload
 (defun msgraph-email-next-page ()
   (interactive)
   (if (not msgraph-email-current-page)
@@ -282,6 +345,7 @@
       :url (or (cdr (assoc '@odata\.nextLink (plist-get msgraph-email-current-page :body)))
 	       (error "no next page"))))))
 
+;;;###autoload
 (defun msgraph-email-previous-page ()
   (interactive)
   (if (not msgraph-email-navigation-history)
@@ -295,6 +359,12 @@
   (msgraph-email-ensure-cache)
   msgraph-email-cache-folders-by-display-name)
 
+;;;###autoload
+(defun msgraph-email-web-compose-new ()
+  (interactive)
+  (browse-url "https://outlook.office365.com/mail/compose"))
+
+;;;###autoload
 (defun msgraph-email-open-conversation (conversation-id)
   (interactive "i")
   (let* ((conversation-id (or conversation-id
@@ -304,6 +374,7 @@
       :type 'conversation
       :conversation-id conversation-id))))
 
+;;;###autoload
 (defun msgraph-email-navigate-to-folder (folder)
   (interactive "i")
   
@@ -320,6 +391,7 @@
 		  (gethash selected-folder (msgraph-email-cache-get-folders-by-display-name))
 		  :id)))))
 
+;;;###autoload
 (defun msgraph-email-navigate (&optional navigation-spec)
   (interactive)
   (let* ((selected-navigation-spec (or navigation-spec msgraph-email-home))
@@ -384,6 +456,7 @@
 		  :navigation-status navigation-status))))
   nil)
 
+;;;###autoload
 (defun msgraph-email-mark-and-move (navigation marker)
   (interactive "i")
   (when (tabulated-list-get-entry)
@@ -392,6 +465,7 @@
       (tabulated-list-print t))
     (eval navigation)))
 
+;;;###autoload
 (defun msgraph-email-unmark-and-move (navigation marker)
   (interactive "i")
   (when (tabulated-list-get-entry)
@@ -400,6 +474,7 @@
       (tabulated-list-print t))
     (eval navigation)))
 
+;;;###autoload
 (defun msgraph-email-remove-all-marks ()
   (interactive)
   (save-excursion
@@ -409,10 +484,11 @@
 	(next-line)))
       (tabulated-list-print t))
 
+;;;###autoload
 (defun msgraph-email-search (&optional filter)
-  (msgraph-email-ensure-cache)
-  
   (interactive "MEnter the search string : ")
+  
+  (msgraph-email-ensure-cache)
   (let* ((folder (completing-read
 		  "Enter the folder name: "
 		  (msgraph-email-cache-get-folders-by-display-name)))
@@ -425,6 +501,7 @@
 		:searchtext filter)))
     (msgraph-email-navigate navigation-spec)))
 
+;;;###autoload
 (defun msgraph-email-open-web-link ()
   (interactive)
   (when (tabulated-list-get-entry)
@@ -456,6 +533,12 @@
       (setq next-url (cdr (assoc '@odata\.nextLink response)))
       (setq retrievals (1+ retrievals)))
 
+    (push (list (cons 'value
+		      (list
+		       (msgraph-get (concat (msgraph-root) "me/mailfolders/recoverableitemsdeletions"))
+		       (msgraph-get (concat (msgraph-root) "me/mailfolders/msgfolderroot"))
+		       (msgraph-get (concat (msgraph-root) "me/mailfolders/searchfolders")))))
+	  folders)
     (mapc
      (lambda (f)
        (let* ((fl (cdr (assoc 'value f))))
@@ -469,3 +552,4 @@
     cache))
 
 (provide 'msgraph-email)
+;;; msgraph-email.el ends here
