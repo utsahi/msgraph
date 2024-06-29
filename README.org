@@ -1,0 +1,39 @@
+** msgraph.el
+
+Utility functions for interaction with the MS Graph API.
+
+#+begin_src emacs-lisp
+  (defun my:msgraph-set-token ()
+    (interactive)
+    (msgraph-set-auth-info "graph.microsoft.com"
+  			 (read-from-minibuffer "Token: " nil nil nil t))
+    (kill-new "<REDACTED>"))  
+#+end_src
+
+** *msgraph-email.el*
+
+A major mode to interact with the MSGraph email API.
+
+*** Supported operations
+
+1. Browsing folders
+2. Soft deleting and hard deleting emails
+3. Searching using Outlook search syntax, with filters such as
+   1. ~received<1/1/2024~
+   2. ~isread:false~
+4. Marking emails as read.
+5. Basic rendering of the email body.
+6. Advanced functions such as composing emails, displaying inline
+   images is delegated to the Outlook web interface.
+
+*** To use
+1. Acquire a token for use with the MS Graph API. This can be done by
+   registering an app in your directory. To try out this library a
+   token from the msgraph explorer tool can be used.
+2. Set the token using the my:msgraph-set-token utility function
+   above.
+3. Browse email with *M-x msgraph-email*
+
+*** Demo
+
+[[file:msgraph-email-demo/MSGraphEmail.gif]]
